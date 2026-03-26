@@ -70,10 +70,17 @@ const manifest: PaperclipPluginManifestV1 = {
   ui: {
     slots: [
       {
+        type: "sidebar",
+        id: "chat-sidebar-link",
+        displayName: "Chat",
+        exportName: "ChatSidebarLink",
+      },
+      {
         type: "page",
         id: "chat-page",
         displayName: "Chat",
         exportName: "ChatPage",
+        routePath: "chat",
       },
       {
         type: "sidebarPanel",

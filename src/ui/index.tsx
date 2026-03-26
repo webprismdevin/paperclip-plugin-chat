@@ -1347,3 +1347,32 @@ export function ChatPage(_props: PluginPageProps) {
 export function ChatSidebarPanel() {
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// ChatSidebarLink — sidebar nav item rendered by PluginSlotOutlet
+// ---------------------------------------------------------------------------
+
+type PluginSidebarProps = {
+  context: { companyPrefix?: string | null };
+};
+
+export function ChatSidebarLink({ context }: PluginSidebarProps) {
+  const prefix = context.companyPrefix ?? "";
+  const href = "/" + prefix + "/chat";
+  const isActive = typeof window !== "undefined" && window.location.pathname === href;
+  return (
+    <a
+      href={href}
+      aria-current={isActive ? "page" : undefined}
+      className={[
+        "flex items-center gap-2.5 px-3 py-2 text-[13px] font-medium transition-colors",
+        isActive
+          ? "bg-accent text-foreground"
+          : "text-foreground/80 hover:bg-accent/50 hover:text-foreground",
+      ].join(" ")}
+    >
+      <IconChat size={16} />
+      <span className="flex-1 truncate">Chat</span>
+    </a>
+  );
+}
