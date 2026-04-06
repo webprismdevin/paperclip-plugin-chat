@@ -42,7 +42,7 @@ const originalMessages = [
 
 assert.equal(
   deriveAutoThreadTitle("A very long first question that should be truncated before sixty characters in the title"),
-  "A very long first question that should be truncated before...",
+  "A very long first question that should be truncated...",
 );
 
 assert.equal(

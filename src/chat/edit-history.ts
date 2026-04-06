@@ -2,7 +2,7 @@ import type { ChatMessage } from "../types.js";
 
 export function deriveAutoThreadTitle(message: string): string {
   const shortTitle =
-    message.length > 60 ? message.slice(0, 60).replace(/\s+\S*$/, "") + "..." : message;
+    message.length > 60 ? message.slice(0, 57).replace(/\s+\S*$/, "") + "..." : message;
 
   return shortTitle.split("\n")[0] ?? shortTitle;
 }
