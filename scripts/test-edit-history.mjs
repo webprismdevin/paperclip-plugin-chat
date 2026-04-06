@@ -69,10 +69,23 @@ const rewound = rewindThreadFromUserEdit({
 });
 
 assert.equal(rewound.messages.length, 3);
+assert.deepEqual(
+  rewound.messages.map((message) => message.id),
+  ["u1", "a1", "u2"],
+);
 assert.equal(rewound.messages[2].id, "u2");
 assert.equal(rewound.messages[2].content, "Edited second question");
 assert.equal(rewound.messages[2].updatedAt, "2026-04-06T00:05:00.000Z");
-assert.equal(rewound.deletedMessageIds.includes("a2"), true);
+assert.deepEqual(rewound.deletedMessageIds, ["a2"]);
+
+assert.throws(() => {
+  rewindThreadFromUserEdit({
+    messages: originalMessages,
+    messageId: "missing",
+    nextContent: "Nope",
+    editedAt: "2026-04-06T00:05:00.000Z",
+  });
+}, /Message not found: missing/);
 
 assert.throws(() => {
   rewindThreadFromUserEdit({
