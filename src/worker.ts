@@ -10,12 +10,33 @@ import type {
 const PLUGIN_NAME = "paperclip-chat";
 
 // ---------------------------------------------------------------------------
-// Claude stream-json parser
+// Agent stdout parser
 // ---------------------------------------------------------------------------
+
+const ANSI_ESCAPE_REGEX = /\u001B\[[0-?]*[ -/]*[@-~]/g;
+
+function normalizePlainTextLine(line: string): string | null {
+  const cleaned = line.replace(ANSI_ESCAPE_REGEX, "").replace(/\r/g, "").trim();
+  if (!cleaned) return null;
+  if (
+    cleaned.startsWith("[paperclip]") ||
+    cleaned.startsWith("[hermes] Starting") ||
+    cleaned.startsWith("[hermes] Exit code") ||
+    cleaned.startsWith("[hermes] Session:") ||
+    cleaned.startsWith("session_id:") ||
+    cleaned.startsWith("╭─ ⚕ Hermes") ||
+    cleaned === "│" ||
+    cleaned === "╰──────────────────────────────────────────────────────────────────────────────╯"
+  ) {
+    return null;
+  }
+  return cleaned;
+}
 
 /**
  * Buffers raw stdout chunks and emits parsed ChatStreamEvents for each
- * complete JSON line from Claude CLI's `--output-format stream-json`.
+ * complete line from structured adapters (Claude/Codex) or plain-text
+ * adapters like Hermes.
  */
 function createStreamJsonParser(emit: (event: ChatStreamEvent) => void) {
   let buffer = "";
@@ -102,6 +123,57 @@ function createStreamJsonParser(emit: (event: ChatStreamEvent) => void) {
             });
           }
 
+          // ── Codex CLI stream-json format ───────────────────────────
+          // Local Codex agents emit turn/item NDJSON events instead of
+          // Anthropic-style block deltas.
+          if (type === "item.started" || type === "item.completed") {
+            const item = obj.item as Record<string, unknown> | undefined;
+            const itemType = item?.type as string | undefined;
+
+            if (itemType === "agent_message" && type === "item.completed" && typeof item?.text === "string") {
+              emit({ type: "text", text: item.text });
+            }
+
+            if (itemType === "command_execution") {
+              const command = typeof item?.command === "string" ? item.command : "command";
+
+              if (type === "item.started") {
+                emit({
+                  type: "tool_use",
+                  name: "command",
+                  input: { command },
+                });
+              }
+
+              if (type === "item.completed") {
+                const aggregatedOutput = typeof item?.aggregated_output === "string" ? item.aggregated_output : "";
+                const exitCode = typeof item?.exit_code === "number" ? item.exit_code : null;
+                const status = typeof item?.status === "string" ? item.status : "completed";
+                const summary = aggregatedOutput.trim() || `Command ${status}${exitCode !== null ? ` (exit ${exitCode})` : ""}`;
+                emit({
+                  type: "tool_result",
+                  content: summary,
+                  isError: exitCode !== null ? exitCode !== 0 : status === "failed",
+                });
+              }
+            }
+          }
+
+          if (type === "turn.completed") {
+            const usage = obj.usage as Record<string, unknown> | undefined;
+            emit({
+              type: "result",
+              usage: usage ? {
+                input_tokens: (usage.input_tokens as number) ?? 0,
+                output_tokens: (usage.output_tokens as number) ?? 0,
+              } : undefined,
+            });
+          }
+
+          if (type === "turn.failed" && typeof obj.error === "string") {
+            emit({ type: "error", text: obj.error });
+          }
+
           // ── Anthropic API streaming format (fallback) ──────────────
           // In case the adapter emits raw API events instead of CLI format.
           if (type === "content_block_delta") {
@@ -114,7 +186,10 @@ function createStreamJsonParser(emit: (event: ChatStreamEvent) => void) {
             }
           }
         } catch {
-          // Not valid JSON — skip
+          const plainText = normalizePlainTextLine(line);
+          if (plainText) {
+            emit({ type: "text", text: `${plainText}\n` });
+          }
         }
       }
     },
@@ -207,6 +282,7 @@ function generateId(): string {
 // ---------------------------------------------------------------------------
 
 const ADAPTER_LABELS: Record<string, string> = {
+  hermes_local: "Hermes",
   claude_local: "Claude",
   openai: "OpenAI",
   codex: "Codex",
@@ -252,7 +328,7 @@ const plugin = definePlugin({
       const companyId = params.companyId as string;
       if (!companyId) {
         return [
-          { type: "claude_local", label: "Claude", available: true, models: [] },
+          { type: "hermes_local", label: "Hermes", available: true, models: [] },
         ] as ChatAdapterInfo[];
       }
       try {
@@ -277,11 +353,11 @@ const plugin = definePlugin({
         }
         const adapters = Array.from(adapterMap.values());
         return adapters.length > 0 ? adapters : [
-          { type: "claude_local", label: "Claude", available: true, models: [] },
+          { type: "hermes_local", label: "Hermes", available: true, models: [] },
         ];
       } catch {
         return [
-          { type: "claude_local", label: "Claude", available: true, models: [] },
+          { type: "hermes_local", label: "Hermes", available: true, models: [] },
         ] as ChatAdapterInfo[];
       }
     });
@@ -289,7 +365,7 @@ const plugin = definePlugin({
     // ── Action: create thread ───────────────────────────────────────
     ctx.actions.register("createThread", async (params: Record<string, unknown>) => {
       const companyId = params.companyId as string;
-      const adapterType = (params.adapterType as string) ?? "claude_local";
+      const adapterType = (params.adapterType as string) ?? "hermes_local";
       const model = (params.model as string) ?? "";
       const title = (params.title as string) ?? "New Chat";
       if (!companyId) throw new Error("companyId is required");
@@ -368,215 +444,219 @@ const plugin = definePlugin({
       const thread = await getThread(ctx, threadId);
       if (!thread) throw new Error("Thread not found");
 
-      // Save user message
-      const msgs = await getMessages(ctx, threadId);
-      const userMsg: ChatMessage = {
-        id: generateId(),
-        threadId,
-        role: "user",
-        content: message,
-        metadata: null,
-        createdAt: new Date().toISOString(),
-      };
-      msgs.push(userMsg);
-      await saveMessages(ctx, threadId, msgs);
-
-      // Mark thread as running
-      thread.status = "running";
-      thread.updatedAt = new Date().toISOString();
-
-      // Auto-generate title from first user message
-      if (thread.title === "New Chat") {
-        const shortTitle = message.length > 60
-          ? message.slice(0, 57).replace(/\s+\S*$/, "") + "..."
-          : message;
-        const titleLine = shortTitle.split("\n")[0] ?? shortTitle;
-        thread.title = titleLine;
-        // TODO: emit title_updated via stream
-      }
-      await saveThread(ctx, thread);
-
-      // Track whether this is the first message in the thread (new session)
-      const isNewSession = !thread.sessionId;
-
-      // Create or resume agent session
-      let sessionId = thread.sessionId;
-      if (!sessionId) {
-        // Look up a chat-suitable agent by adapter type
-        // Prefer agents with role "assistant" (dedicated chat agents) over task-oriented agents
-        const agents = await ctx.agents.list({ companyId });
-        const matching = agents.filter((a) => a.adapterType === thread.adapterType);
-        const agent = matching.find((a) => a.name === "Chat Assistant") ?? matching.find((a) => a.role === "general") ?? matching[0];
-        if (!agent) {
-          throw new Error(`No agent found with adapter type "${thread.adapterType}". Available: ${agents.map((a) => `${a.name}(${a.adapterType})`).join(", ") || "none"}`);
-        }
-        const session = await ctx.agents.sessions.create(agent.id, companyId, {
-          reason: "Chat plugin: new conversation",
-        });
-        sessionId = session.sessionId;
-        thread.sessionId = sessionId;
-        await saveThread(ctx, thread);
-      }
-
-      // Build agent context for the first message so the copilot knows about
-      // available agents and can reference them for handoff.
-      let enrichedMessage = message;
-      if (isNewSession) {
-        const allAgents = await ctx.agents.list({ companyId });
-        const agentContext = allAgents.length > 0
-          ? `[Available Agents]\n${allAgents.map(a => `- @${a.name} (Role: ${a.role ?? "general"}, Title: ${a.title ?? "N/A"}, Status: ${a.status ?? "unknown"})`).join("\n")}\n\n`
-          : "";
-        enrichedMessage = agentContext + message;
-      }
-
-      // Open SSE stream channel for this thread so the UI gets real-time events
       const streamChannel = `chat:${threadId}`;
-      ctx.streams.open(streamChannel, companyId);
+      let streamOpened = false;
 
-      // Collect response segments for persistence
-      const segments: ChatMessage["metadata"] = { segments: [] };
-      let fullResponse = "";
-
-      // Emit title update if it changed
-      if (thread.title !== "New Chat") {
-        ctx.streams.emit(streamChannel, { type: "title_updated", title: thread.title });
-      }
-
-      // Send message and stream events.
-      // ctx.agents.sessions.sendMessage returns immediately once the run is
-      // queued — the onEvent callback fires asynchronously via JSON-RPC
-      // notifications.  We must wait for the terminal event before saving.
-      const RUN_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
-      let runId: string | undefined;
-
-      await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => {
-          reject(new Error("Chat response timed out"));
-        }, RUN_TIMEOUT_MS);
-
-        // Helper to process parsed stream events
-        const handleParsedEvent = (chatEvent: ChatStreamEvent) => {
-          // Accumulate for persistence
-          if (chatEvent.type === "text" && chatEvent.text) {
-            fullResponse += chatEvent.text;
-            const last = segments.segments[segments.segments.length - 1];
-            if (last && last.kind === "text") {
-              last.content += chatEvent.text;
-            } else {
-              segments.segments.push({ kind: "text", content: chatEvent.text });
-            }
-          }
-          if (chatEvent.type === "thinking" && chatEvent.text) {
-            const last = segments.segments[segments.segments.length - 1];
-            if (last && last.kind === "thinking") {
-              last.content += chatEvent.text;
-            } else {
-              segments.segments.push({ kind: "thinking", content: chatEvent.text });
-            }
-          }
-          if (chatEvent.type === "tool_use") {
-            segments.segments.push({
-              kind: "tool",
-              name: chatEvent.name ?? "tool",
-              input: chatEvent.input,
-            });
-          }
-          if (chatEvent.type === "tool_result") {
-            for (let i = segments.segments.length - 1; i >= 0; i--) {
-              const seg = segments.segments[i];
-              if (seg && seg.kind === "tool" && seg.result === undefined) {
-                seg.result = chatEvent.content ?? "";
-                seg.isError = chatEvent.isError ?? false;
-                break;
-              }
-            }
-          }
-          if (chatEvent.type === "session_init" && chatEvent.sessionId) {
-            thread.sessionId = chatEvent.sessionId;
-          }
-
-          // Terminal events: run completed or errored — resolve the wait
-          if (chatEvent.type === "result" || chatEvent.type === "error") {
-            clearTimeout(timer);
-            resolve();
-          }
-
-          // Push event to UI via SSE stream in real-time
-          ctx.streams.emit(streamChannel, chatEvent);
-        };
-
-        // Parse raw stdout chunks (Claude stream-json format) into events
-        const parser = createStreamJsonParser(handleParsedEvent);
-
-        ctx.agents.sessions.sendMessage(sessionId, companyId, {
-          prompt: enrichedMessage,
-          reason: "Chat plugin: user message",
-          onEvent: (event: AgentSessionEvent) => {
-            // The host forwards raw stdout/stderr chunks as "chunk" events.
-            // For stdout chunks, parse the Claude stream-json format.
-            if (event.eventType === "chunk") {
-              const stream = event.stream ?? (event.payload?.stream as string | undefined);
-              if (stream === "stdout" && event.message) {
-                parser.push(event.message);
-              }
-              // Ignore stderr chunks
-              return;
-            }
-
-            // Terminal events from the host (run status changes)
-            if (event.eventType === "done") {
-              parser.flush();
-              handleParsedEvent({
-                type: "result",
-                usage: event.payload?.usage as ChatStreamEvent["usage"],
-                costUsd: event.payload?.costUsd as number | undefined,
-              });
-              return;
-            }
-            if (event.eventType === "error") {
-              parser.flush();
-              handleParsedEvent({ type: "error", text: event.message ?? "Unknown error" });
-              return;
-            }
-            if (event.eventType === "status" && event.payload?.sessionId) {
-              handleParsedEvent({ type: "session_init", sessionId: event.payload.sessionId as string });
-            }
-          },
-        }).then((result) => {
-          runId = result.runId;
-        }).catch((err) => {
-          clearTimeout(timer);
-          reject(err);
-        });
-      });
-
-      // Stream complete — save assistant message
-      if (fullResponse || segments.segments.length > 0) {
-        const assistantMsg: ChatMessage = {
+      try {
+        // Save user message
+        const msgs = await getMessages(ctx, threadId);
+        const userMsg: ChatMessage = {
           id: generateId(),
           threadId,
-          role: "assistant",
-          content: fullResponse,
-          metadata: segments,
+          role: "user",
+          content: message,
+          metadata: null,
           createdAt: new Date().toISOString(),
         };
-        const updatedMsgs = await getMessages(ctx, threadId);
-        updatedMsgs.push(assistantMsg);
-        await saveMessages(ctx, threadId, updatedMsgs);
+        msgs.push(userMsg);
+        await saveMessages(ctx, threadId, msgs);
+
+        // Mark thread as running
+        thread.status = "running";
+        thread.updatedAt = new Date().toISOString();
+
+        // Auto-generate title from first user message
+        if (thread.title === "New Chat") {
+          const shortTitle = message.length > 60
+            ? message.slice(0, 57).replace(/\s+\S*$/, "") + "..."
+            : message;
+          const titleLine = shortTitle.split("\n")[0] ?? shortTitle;
+          thread.title = titleLine;
+        }
+        await saveThread(ctx, thread);
+
+        // Track whether this is the first message in the thread (new session)
+        const isNewSession = !thread.sessionId;
+
+        // Create or resume agent session
+        let sessionId = thread.sessionId;
+        if (!sessionId) {
+          // Look up a chat-suitable agent by adapter type.
+          // If the stored adapter no longer exists, fall back to the first live adapter
+          // so old/broken drafts can still recover.
+          const agents = await ctx.agents.list({ companyId });
+          let matching = agents.filter((a) => a.adapterType === thread.adapterType && a.status !== "terminated");
+          if (matching.length === 0) {
+            const fallbackAgent = agents.find((a) => a.status !== "terminated");
+            if (fallbackAgent) {
+              thread.adapterType = fallbackAgent.adapterType;
+              thread.updatedAt = new Date().toISOString();
+              await saveThread(ctx, thread);
+              matching = agents.filter((a) => a.adapterType === thread.adapterType && a.status !== "terminated");
+            }
+          }
+          const agent = matching.find((a) => a.name === "Chat Assistant") ?? matching.find((a) => a.role === "general") ?? matching[0];
+          if (!agent) {
+            throw new Error(`No agent found with adapter type "${thread.adapterType}". Available: ${agents.map((a) => `${a.name}(${a.adapterType})`).join(", ") || "none"}`);
+          }
+          const session = await ctx.agents.sessions.create(agent.id, companyId, {
+            reason: "Chat plugin: new conversation",
+          });
+          sessionId = session.sessionId;
+          thread.sessionId = sessionId;
+          await saveThread(ctx, thread);
+        }
+
+        // Keep the user prompt verbatim. Injecting a roster of agents into the
+        // first turn makes simple questions read like orchestration tasks and
+        // leads to vague replies instead of direct answers.
+        const enrichedMessage = message;
+
+        // Open SSE stream channel for this thread so the UI gets real-time events
+        ctx.streams.open(streamChannel, companyId);
+        streamOpened = true;
+
+        // Collect response segments for persistence
+        const segments: ChatMessage["metadata"] = { segments: [] };
+        let fullResponse = "";
+
+        if (thread.title !== "New Chat") {
+          ctx.streams.emit(streamChannel, { type: "title_updated", title: thread.title });
+        }
+
+        const RUN_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+        let runId: string | undefined;
+
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => {
+            reject(new Error("Chat response timed out"));
+          }, RUN_TIMEOUT_MS);
+
+          const handleParsedEvent = (chatEvent: ChatStreamEvent) => {
+            if (chatEvent.type === "text" && chatEvent.text) {
+              fullResponse += chatEvent.text;
+              const last = segments.segments[segments.segments.length - 1];
+              if (last && last.kind === "text") {
+                last.content += chatEvent.text;
+              } else {
+                segments.segments.push({ kind: "text", content: chatEvent.text });
+              }
+            }
+            if (chatEvent.type === "thinking" && chatEvent.text) {
+              const last = segments.segments[segments.segments.length - 1];
+              if (last && last.kind === "thinking") {
+                last.content += chatEvent.text;
+              } else {
+                segments.segments.push({ kind: "thinking", content: chatEvent.text });
+              }
+            }
+            if (chatEvent.type === "tool_use") {
+              segments.segments.push({
+                kind: "tool",
+                name: chatEvent.name ?? "tool",
+                input: chatEvent.input,
+              });
+            }
+            if (chatEvent.type === "tool_result") {
+              for (let i = segments.segments.length - 1; i >= 0; i--) {
+                const seg = segments.segments[i];
+                if (seg && seg.kind === "tool" && seg.result === undefined) {
+                  seg.result = chatEvent.content ?? "";
+                  seg.isError = chatEvent.isError ?? false;
+                  break;
+                }
+              }
+            }
+            if (chatEvent.type === "session_init" && chatEvent.sessionId) {
+              thread.sessionId = chatEvent.sessionId;
+            }
+
+            if (chatEvent.type === "result" || chatEvent.type === "error") {
+              clearTimeout(timer);
+              resolve();
+            }
+
+            ctx.streams.emit(streamChannel, chatEvent);
+          };
+
+          const parser = createStreamJsonParser(handleParsedEvent);
+
+          ctx.agents.sessions.sendMessage(sessionId, companyId, {
+            prompt: enrichedMessage,
+            reason: "Chat plugin: user message",
+            onEvent: (event: AgentSessionEvent) => {
+              if (event.eventType === "chunk") {
+                const stream = event.stream ?? (event.payload?.stream as string | undefined);
+                if (stream === "stdout" && event.message) {
+                  parser.push(event.message);
+                }
+                return;
+              }
+
+              if (event.eventType === "done") {
+                parser.flush();
+                handleParsedEvent({
+                  type: "result",
+                  usage: event.payload?.usage as ChatStreamEvent["usage"],
+                  costUsd: event.payload?.costUsd as number | undefined,
+                });
+                return;
+              }
+              if (event.eventType === "error") {
+                parser.flush();
+                handleParsedEvent({ type: "error", text: event.message ?? "Unknown error" });
+                return;
+              }
+              if (event.eventType === "status" && event.payload?.sessionId) {
+                handleParsedEvent({ type: "session_init", sessionId: event.payload.sessionId as string });
+              }
+            },
+          }).then((result) => {
+            runId = result.runId;
+          }).catch((err) => {
+            clearTimeout(timer);
+            reject(err);
+          });
+        });
+
+        if (fullResponse || segments.segments.length > 0) {
+          const assistantMsg: ChatMessage = {
+            id: generateId(),
+            threadId,
+            role: "assistant",
+            content: fullResponse,
+            metadata: segments,
+            createdAt: new Date().toISOString(),
+          };
+          const updatedMsgs = await getMessages(ctx, threadId);
+          updatedMsgs.push(assistantMsg);
+          await saveMessages(ctx, threadId, updatedMsgs);
+        }
+
+        thread.status = "idle";
+        thread.updatedAt = new Date().toISOString();
+        await saveThread(ctx, thread);
+
+        ctx.streams.emit(streamChannel, { type: "done" });
+        ctx.streams.close(streamChannel);
+
+        ctx.logger.info(`Chat message completed`, { threadId, runId });
+
+        return { ok: true, runId };
+      } catch (err) {
+        thread.status = "idle";
+        thread.updatedAt = new Date().toISOString();
+        await saveThread(ctx, thread).catch(() => {});
+
+        const errorText = err instanceof Error ? err.message : String(err);
+        if (streamOpened) {
+          ctx.streams.emit(streamChannel, { type: "error", text: errorText });
+          ctx.streams.emit(streamChannel, { type: "done" });
+          ctx.streams.close(streamChannel);
+        }
+        ctx.logger.error("Chat message failed", { threadId, error: errorText });
+        throw err;
       }
-
-      // Mark thread idle
-      thread.status = "idle";
-      thread.updatedAt = new Date().toISOString();
-      await saveThread(ctx, thread);
-
-      // Signal stream completion and close the channel
-      ctx.streams.emit(streamChannel, { type: "done" });
-      ctx.streams.close(streamChannel);
-
-      ctx.logger.info(`Chat message completed`, { threadId, runId });
-
-      return { ok: true, runId };
     });
 
     // ── Action: stop a running response ─────────────────────────────

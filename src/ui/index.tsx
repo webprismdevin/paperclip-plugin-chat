@@ -1,8 +1,10 @@
-import type { PluginPageProps } from "@paperclipai/plugin-sdk/ui";
+import type { PluginPageProps, PluginSidebarProps } from "@paperclipai/plugin-sdk/ui";
 import { usePluginData, usePluginAction, useHostContext, usePluginStream } from "@paperclipai/plugin-sdk/ui";
-import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
+import type { ComponentType, KeyboardEvent, MouseEvent, RefObject } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { getChatRecoveryMode } from "./recovery.js";
 import type {
   ChatThread,
   ChatMessage,
@@ -15,9 +17,17 @@ import type {
 // SVG Icons — match core chat UI icons
 // ---------------------------------------------------------------------------
 
-function IconChat({ size = 16, color = "currentColor" }: { size?: number; color?: string }) {
+function IconChat({
+  size = 16,
+  color = "currentColor",
+  className,
+}: {
+  size?: number;
+  color?: string;
+  className?: string;
+}) {
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+    <svg className={className} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
       <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" />
     </svg>
   );
@@ -111,7 +121,7 @@ function useIsMobile(breakpointPx = 768): boolean {
 }
 
 function useAvailableHeight(
-  ref: React.RefObject<HTMLElement | null>,
+  ref: RefObject<HTMLElement | null>,
   options?: { bottomPadding?: number; minHeight?: number },
 ): number | null {
   const bottomPadding = options?.bottomPadding ?? 24;
@@ -144,7 +154,7 @@ function useAvailableHeight(
 // Markdown link component — open links in new tab
 // ---------------------------------------------------------------------------
 
-const mdComponents: Record<string, React.ComponentType<any>> = {
+const mdComponents: Record<string, ComponentType<any>> = {
   a: ({ href, children, ...props }: any) => (
     <a href={href} target="_blank" rel="noopener noreferrer" {...props}>{children}</a>
   ),
@@ -672,11 +682,11 @@ function ChatInput({
   setInput: (v: string) => void;
   onSend: () => void;
   onStop: () => void;
-  onKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+  onKeyDown: (e: KeyboardEvent<HTMLTextAreaElement>) => void;
   isStreaming: boolean;
   sending: boolean;
   placeholder: string;
-  textareaRef: React.RefObject<HTMLTextAreaElement>;
+  textareaRef: RefObject<HTMLTextAreaElement>;
   adjustTextareaHeight: () => void;
   showSlashMenu: boolean;
   filteredCommands: SlashCommand[];
@@ -770,7 +780,7 @@ function ChatInput({
                 ))}
               </select>
             ) : (
-              <span>{availableAdapters.find((a) => a.type === selectedAdapter)?.label ?? "Claude"}</span>
+              <span>{availableAdapters.find((a) => a.type === selectedAdapter)?.label ?? "Hermes"}</span>
             )}
           </span>
         )}
@@ -809,7 +819,7 @@ export function ChatPage(_props: PluginPageProps) {
 
   // Thread state
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
-  const [selectedAdapter, setSelectedAdapter] = useState("claude_local");
+  const [selectedAdapter, setSelectedAdapter] = useState("hermes_local");
   const [selectedModel, setSelectedModel] = useState("");
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -856,7 +866,7 @@ export function ChatPage(_props: PluginPageProps) {
   const updateThreadTitle = usePluginAction("updateThreadTitle");
 
   // SSE stream
-  const streamChannel = selectedThreadId ? `chat:${selectedThreadId}` : "";
+  const streamChannel = selectedThreadId ? `chat:${selectedThreadId}` : "chat:__idle__";
   const { events: streamEvents, connected: streamConnected } = usePluginStream<ChatStreamEvent>(
     streamChannel,
     { companyId: companyId ?? undefined },
@@ -867,6 +877,13 @@ export function ChatPage(_props: PluginPageProps) {
   const currentAdapter = availableAdapters.find((a) => a.type === selectedAdapter) ?? availableAdapters[0];
   const currentModels = currentAdapter?.models ?? [];
   const selectedThread = threads?.find((t) => t.id === selectedThreadId) ?? null;
+  const hasRunningThreads = threads?.some((thread) => thread.status === "running") ?? false;
+  const recoveryMode = getChatRecoveryMode({
+    hasRunningThreads,
+    selectedThreadId,
+    selectedThreadStatus: selectedThread?.status,
+    streamConnected,
+  });
   const isStreaming = selectedThread?.status === "running" || sending;
 
   // Slash command detection
@@ -910,6 +927,28 @@ export function ChatPage(_props: PluginPageProps) {
     }
   }, [streamEvents, refreshMessages, refreshThreads]);
 
+  useEffect(() => {
+    if (recoveryMode === "none") return;
+
+    const intervalId = window.setInterval(() => {
+      refreshThreads();
+      if (recoveryMode === "selected") {
+        refreshMessages();
+      }
+    }, 1000);
+
+    return () => window.clearInterval(intervalId);
+  }, [recoveryMode, refreshMessages, refreshThreads]);
+
+  useEffect(() => {
+    if (selectedThread?.status === "running" || sending) return;
+
+    setStreamingText("");
+    setStreamingThinking("");
+    setStreamingError("");
+    lastProcessedCount.current = 0;
+  }, [selectedThread?.status, sending]);
+
   // Auto-scroll
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -922,6 +961,15 @@ export function ChatPage(_props: PluginPageProps) {
       setSelectedModel(selectedThread.model);
     }
   }, [selectedThread]);
+
+  // Keep the compose state aligned with adapters the host actually exposes.
+  useEffect(() => {
+    if (selectedThread || availableAdapters.length === 0) return;
+    if (!availableAdapters.some((adapter) => adapter.type === selectedAdapter)) {
+      setSelectedAdapter(availableAdapters[0]!.type);
+      setSelectedModel("");
+    }
+  }, [availableAdapters, selectedAdapter, selectedThread]);
 
   // Default model
   useEffect(() => {
@@ -996,6 +1044,7 @@ export function ChatPage(_props: PluginPageProps) {
       });
     } catch (err) {
       console.error("Send failed:", err);
+      setStreamingError(err instanceof Error ? err.message : String(err));
     } finally {
       setSending(false);
       refreshMessages();
@@ -1034,6 +1083,7 @@ export function ChatPage(_props: PluginPageProps) {
       await sendMessage({ threadId, message: cmd.prompt, companyId });
     } catch (err) {
       console.error("Send failed:", err);
+      setStreamingError(err instanceof Error ? err.message : String(err));
     } finally {
       setSending(false);
       refreshMessages();
@@ -1058,6 +1108,7 @@ export function ChatPage(_props: PluginPageProps) {
       await sendMessage({ threadId: thread.id, message: prompt, companyId });
     } catch (err) {
       console.error("Send failed:", err);
+      setStreamingError(err instanceof Error ? err.message : String(err));
     } finally {
       setSending(false);
       refreshMessages();
@@ -1065,7 +1116,7 @@ export function ChatPage(_props: PluginPageProps) {
     }
   }, [companyId, selectedAdapter, selectedModel, createThread, sendMessage, refreshMessages, refreshThreads]);
 
-  const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+  const handleKeyDown = useCallback((e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (showSlashMenu) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -1104,7 +1155,7 @@ export function ChatPage(_props: PluginPageProps) {
     onKeyDown: handleKeyDown,
     isStreaming,
     sending,
-    textareaRef: textareaRef as React.RefObject<HTMLTextAreaElement>,
+    textareaRef: textareaRef as RefObject<HTMLTextAreaElement>,
     adjustTextareaHeight,
     showSlashMenu,
     filteredCommands,
@@ -1344,6 +1395,42 @@ export function ChatPage(_props: PluginPageProps) {
 // ChatSidebarPanel — compact sidebar entry point
 // ---------------------------------------------------------------------------
 
-export function ChatSidebarPanel() {
-  return null;
+export function ChatSidebarLink({ context }: PluginSidebarProps) {
+  const prefix = context.companyPrefix ? `/${context.companyPrefix}` : "";
+  const href = `${prefix}/chat`;
+  const isActive = typeof window !== "undefined" && window.location.pathname === href;
+
+  const handleClick = (event: MouseEvent<HTMLAnchorElement>) => {
+    if (
+      event.defaultPrevented ||
+      event.button !== 0 ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.shiftKey ||
+      event.altKey
+    ) {
+      return;
+    }
+
+    event.preventDefault();
+    if (window.location.pathname === href) return;
+    window.history.pushState({}, "", href);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  };
+
+  return (
+    <a
+      href={href}
+      onClick={handleClick}
+      aria-current={isActive ? "page" : undefined}
+      className={isActive
+        ? "flex items-center gap-2.5 px-3 py-2 text-[13px] font-medium transition-colors bg-accent text-foreground"
+        : "flex items-center gap-2.5 px-3 py-2 text-[13px] font-medium transition-colors text-foreground/80 hover:bg-accent/50 hover:text-foreground"}
+    >
+      <span className="relative shrink-0" aria-hidden="true">
+        <IconChat size={16} className="h-4 w-4" />
+      </span>
+      <span>Chat</span>
+    </a>
+  );
 }

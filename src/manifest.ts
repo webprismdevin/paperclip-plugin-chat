@@ -9,7 +9,7 @@ const manifest: PaperclipPluginManifestV1 = {
   version: PLUGIN_VERSION,
   displayName: "Chat",
   description:
-    "Multi-adapter AI chat for Paperclip. Supports Claude, Codex, and OpenCode with real-time streaming, session persistence, and tool visibility.",
+    "Multi-adapter AI chat for Paperclip. Supports Hermes, Claude, Codex, and OpenCode with real-time streaming, session persistence, and tool visibility.",
   author: "Paperclip",
   categories: ["workspace", "ui"],
   capabilities: [
@@ -42,8 +42,8 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "string",
         title: "Default Adapter",
         description: "Which adapter to use by default for new threads",
-        default: "claude_local",
-        enum: ["claude_local", "codex_local", "opencode_local"],
+        default: "hermes_local",
+        enum: ["hermes_local", "claude_local", "codex_local", "opencode_local"],
       },
       systemPromptOverride: {
         type: "string",
@@ -54,19 +54,6 @@ const manifest: PaperclipPluginManifestV1 = {
     },
   },
 
-  launchers: [
-    {
-      id: "chat-nav",
-      displayName: "Chat",
-      description: "Open the AI chat page",
-      placementZone: "sidebar",
-      action: {
-        type: "navigate",
-        target: "plugins/paperclip-chat",
-      },
-    },
-  ],
-
   ui: {
     slots: [
       {
@@ -74,12 +61,13 @@ const manifest: PaperclipPluginManifestV1 = {
         id: "chat-page",
         displayName: "Chat",
         exportName: "ChatPage",
+        routePath: "chat",
       },
       {
-        type: "sidebarPanel",
-        id: "chat-sidebar",
+        type: "sidebar",
+        id: "chat-sidebar-link",
         displayName: "Chat",
-        exportName: "ChatSidebarPanel",
+        exportName: "ChatSidebarLink",
       },
     ],
   },

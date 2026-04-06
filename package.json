@@ -17,7 +17,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@paperclipai/plugin-sdk": "^1.0.0"
+    "@paperclipai/plugin-sdk": "^2026.403.0",
+    "paperclip-plugin-telegram": "https://codeload.github.com/mvanhorn/paperclip-plugin-telegram/tar.gz/refs/heads/main"
   },
   "devDependencies": {
     "@types/node": "^24.6.0",
@@ -26,6 +27,8 @@
     "esbuild": "^0.27.3",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
     "typescript": "^5.7.3"
   },
   "peerDependencies": {
