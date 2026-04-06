@@ -23,6 +23,7 @@ export interface ChatMessage {
   content: string;
   metadata: ChatMessageMetadata | null;
   createdAt: string;
+  updatedAt?: string;
 }
 
 /** Structured metadata stored with assistant messages */
