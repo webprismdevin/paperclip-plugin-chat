@@ -938,6 +938,27 @@ export function ChatPage(_props: PluginPageProps) {
     lastProcessedCount.current = 0;
   }, [selectedThreadId]);
 
+  // Background-tab safety net: when the tab regains visibility (or the window
+  // regains focus), pull fresh thread/message state from the server. SSE events
+  // emitted while the tab was hidden are dropped by the in-memory PluginStreamBus
+  // if there is no live subscriber, and EventSource does not always reconnect
+  // promptly after Chrome's background-tab throttling. Refetching on focus
+  // closes the gap without waiting for a manual F5.
+  useEffect(() => {
+    const refetchIfVisible = () => {
+      if (document.visibilityState === "visible") {
+        refreshMessages();
+        refreshThreads();
+      }
+    };
+    document.addEventListener("visibilitychange", refetchIfVisible);
+    window.addEventListener("focus", refetchIfVisible);
+    return () => {
+      document.removeEventListener("visibilitychange", refetchIfVisible);
+      window.removeEventListener("focus", refetchIfVisible);
+    };
+  }, [refreshMessages, refreshThreads]);
+
   // Reset slash menu
   useEffect(() => {
     setSlashMenuIndex(0);
